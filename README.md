@@ -64,7 +64,120 @@ python -m training.train_duration_predictor \
 
 Pass `--config supertonic-3-model/onnx/tts.json` to any script to train at the
 larger, publicly released model scale (~99M params) instead of the paper's
-44M-parameter research checkpoint (the default, no `--config` needed).
+44M-parameter research checkpoint (the default, no `--config` needed). For a small
+single-speaker set (a few hours) the 44M default often trains faster and overfits less;
+the walkthrough below uses `--config` only to stay at the released scale.
+
+## End-to-end walkthrough: training a voice from scratch on your own data
+
+Practical guide for training a usable single-speaker voice from scratch on a few hours of
+audio, distilled from a real Urdu run. The repo-root script `train_urdu_from_scratch.sh`
+wraps every command here — edit the paths and `STAGE*_STEPS` at its top, then:
+
+```bash
+./train_urdu_from_scratch.sh clean    # (optional) delete old checkpoints
+./train_urdu_from_scratch.sh stage1   # autoencoder
+#   ...sanity-check reconstruction (see below) before spending hours downstream...
+./train_urdu_from_scratch.sh stage2   # text-to-latent
+./train_urdu_from_scratch.sh stage3   # duration predictor
+#   or run everything back-to-back:  ./train_urdu_from_scratch.sh all
+```
+
+### The data flow, stage by stage
+
+1. **Stage 1 — speech autoencoder** (`train_autoencoder.py`): learns waveform ⟷ 24-dim latent
+   (spec → ConvNeXt encoder → latent → WaveNeXt decoder → waveform), adversarially, on short
+   0.19 s segments. From scratch means encoder **and** decoder are learned from random. At the
+   end it refits the latent normalization stats (`latent_mean`/`latent_std`) over the trained
+   encoder and writes `ckpt_final.pt` — **the only stage-1 checkpoint stages 2/3 should use.**
+2. **Stage 2 — text-to-latent** (`train_text_to_latent.py`): freezes the stage-1 encoder, uses
+   it on the fly to turn each clip into a target latent, and learns to generate that latent from
+   characters via conditional flow matching. Text conditions generation through cross-attention
+   — this is where alignment is learned; there is no separate aligner. Builds a tokenizer from
+   your corpus → `ttl_scratch/tokenizer.json`.
+3. **Stage 3 — duration predictor** (`train_duration_predictor.py`): also freezes the stage-1
+   encoder; learns one scalar — total utterance duration from text + a reference-speech latent.
+   Tiny and fast. At synthesis it sets how many latent frames to generate.
+
+Stages 2 and 3 are independent of each other but both need stage 1. Reuse stage 2's tokenizer
+for stage 3 so the two share an identical character vocabulary.
+
+### Things that silently ruin a run — be careful of these
+
+- **Only `ckpt_final.pt` has correct latent stats.** Latent normalization stats live inside the
+  autoencoder checkpoint, and intermediate stage-1 checkpoints (`ckpt_5000.pt`, …) carry stale
+  ones (a previous/never-fit value), not the trained encoder's. Stages 2/3 normalize with these
+  and synthesis de-normalizes with them; a mismatch feeds the decoder mis-scaled latents and you
+  get **pure buzzing, no speech at all**. Always point stages 2/3 and synthesis at
+  `ckpt_final.pt`. To reuse an earlier checkpoint, first bake correct stats in with
+  `training/finalize_ae_stats.py`.
+- **`--max_audio_seconds` must be ≥ your longest clip.** Longer clips get truncated. In stage 2
+  that pairs a full transcript with partial audio (breaks alignment); in stage 3 the duration
+  *target* is the truncated length, so you train systematically-too-short durations. Check your
+  max clip length and set this to cover it (the Urdu set maxed at 18.0 s → `--max_audio_seconds 18`).
+- **Text↔latent alignment uses length-aware RoPE.** The compressed latent runs at ~14 Hz
+  (`Kc=6`) — only ~1.1 latent frames per character, nowhere near a 10:1 ratio. The text
+  cross-attention normalizes query/key positions by each sequence's own length
+  (`length_aware=True` in `Attention.forward`; arXiv:2509.11084) so the alignment prior is a
+  correct monotonic diagonal. Absolute-index RoPE here silently maps the whole utterance onto
+  the first ~10% of the text and alignment never forms.
+- **Batch size vs. VRAM.** Stage 2's effective batch is `batch_size × n_batch_expand` (=6), each
+  up to `max_audio_seconds` long: `--batch_size 8 --max_audio_seconds 18` ≈ 17 GB on a 24 GB
+  card. Stage 3 encodes whole clips too — keep `--batch_size 16` or lower. Stage 1's 0.19 s
+  segments make its default `--batch_size 32` cheap.
+- **Sample rate.** The model runs at 44.1 kHz (`ae.sample_rate` in `tts.json`); the loader
+  resamples anything else on the fly, so a 22 kHz source trains fine — but upsampling adds no
+  real treble, so source rate caps final crispness.
+- **Audio I/O.** Read/write with `soundfile`, not `torchaudio.save`: torchaudio's default
+  TorchCodec/FFmpeg backend is missing/broken in many CUDA-wheel envs (`libnvrtc.so.*` errors).
+
+### Sanity-check stage 1 before running stages 2/3
+
+A bad autoencoder caps everything downstream, so verify it reconstructs speech first:
+
+```bash
+python -m training.reconstruct \
+  --ref_wav <a real clip>.wav --config supertonic-3-model/onnx/tts.json \
+  --autoencoder_ckpt runs/ae_scratch/ckpt_final.pt --out_dir tts_outputs
+```
+
+Writes `recon_A_copysynth.wav` (encode→decode of the real clip, no TTS). Intelligible ⇒
+encoder/decoder are sound and any later garbage is the text-to-latent model; noise ⇒ train
+stage 1 longer. It also prints the encoder's latent std next to the stored stats — same order
+of magnitude is what you want.
+
+### Synthesis
+
+```bash
+python -m training.synthesize \
+  --text_file utterance.txt --lang ur --ref_wav <reference voice>.wav \
+  --config supertonic-3-model/onnx/tts.json \
+  --tokenizer runs/ttl_scratch/tokenizer.json \
+  --autoencoder_ckpt runs/ae_scratch/ckpt_final.pt \
+  --ttl_ckpt runs/ttl_scratch/ckpt_final.pt \
+  --dp_ckpt runs/dp_scratch/ckpt_final.pt \
+  --peak_normalize --out_wav out.wav
+```
+
+Use `--text_file` (not `--text`) for non-Latin/RTL scripts to dodge shell-quoting issues. Drop
+`--dp_ckpt` and pass `--duration_seconds N` to bypass the duration predictor (handy before stage
+3 exists, or to A/B a known length). `--peak_normalize` because the decoder reconstructs quiet.
+
+### Tracking progress objectively
+
+Flow-matching loss barely moves and doesn't reflect intelligibility. Use
+`training/coherence_eval.py` to synthesize a few held-out eval sentences at a checkpoint and
+print spectral flatness (~0 = speech-structured, ~1 = noise), 2–10 Hz syllable modulation
+(higher = clearer rhythm; real speech ≈ 0.97), and mel-envelope correlation to the real clip —
+the content/alignment signal, which climbs off ~0 only once the model actually follows the text.
+
+```bash
+python -m training.coherence_eval \
+  --eval_filelist training/data/eval.txt --root_dir <data> \
+  --config supertonic-3-model/onnx/tts.json --tokenizer runs/ttl_scratch/tokenizer.json \
+  --autoencoder_ckpt runs/ae_scratch/ckpt_final.pt --ttl_ckpt runs/ttl_scratch/ckpt_10000.pt \
+  --n 6 --out_dir tts_outputs/eval
+```
 
 ## Fine-tuning Supertone's released model for a new language
 
@@ -125,8 +238,17 @@ Notes:
   full pretraining run, but watch your own loss curves.
 - The character vocabulary you fine-tune with must be able to represent the new
   language's script. If it uses characters absent from `unicode_indexer.json`
-  entirely, they'll fall back to the pad id (character 0) at encode time; there's no
-  vocab-extension path here.
+  entirely, use `CharTokenizer.extend_with_texts` to append them after the ported
+  tokenizer's existing ids (keeping every known character's pretrained embedding row
+  aligned), save the result, and pass it as `--tokenizer` to stages 2 and 3.
+  `train_text_to_latent.py`/`train_duration_predictor.py`'s `--init_ckpt` loading
+  tolerates the resulting embedding-table size mismatch via
+  `ckpt_utils.load_state_dict_grow_vocab`, leaving the newly appended rows at fresh
+  initialization while every other row (and every other tensor) is loaded from the
+  checkpoint unchanged. Note `normalize_text` applies NFKD first, so some
+  precomposed characters (e.g. Arabic/Urdu presentation forms) decompose into
+  base-letter + combining-mark sequences that may already be covered without adding
+  a new id at all.
 
 ### Smoke-tested, not benchmarked
 

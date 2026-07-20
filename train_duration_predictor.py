@@ -43,7 +43,14 @@ def parse_args():
     p.add_argument("--out_dir", required=True)
     p.add_argument("--config", default=None)
     p.add_argument("--tokenizer", default=None)
-    p.add_argument("--max_audio_seconds", type=float, default=10.0)
+    p.add_argument(
+        "--max_audio_seconds",
+        type=float,
+        default=10.0,
+        help="clips longer than this are truncated. IMPORTANT: the duration target is the "
+        "(post-truncation) wav length, so any clip longer than this trains a WRONG, too-short "
+        "duration. Set it >= your longest utterance so no clip is truncated.",
+    )
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--iters", type=int, default=3000)

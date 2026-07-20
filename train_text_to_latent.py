@@ -43,7 +43,13 @@ def parse_args():
     p.add_argument("--out_dir", required=True)
     p.add_argument("--config", default=None)
     p.add_argument("--tokenizer", default=None, help="existing tokenizer.json; built from the filelist otherwise")
-    p.add_argument("--max_audio_seconds", type=float, default=10.0)
+    p.add_argument(
+        "--max_audio_seconds",
+        type=float,
+        default=10.0,
+        help="clips longer than this are truncated from the end while their full transcript is kept, "
+        "which mispairs text with audio and hurts alignment. Set it >= your longest utterance.",
+    )
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--lr_halve_every", type=int, default=300_000)
