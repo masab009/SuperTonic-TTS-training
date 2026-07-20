@@ -7,6 +7,14 @@ Example:
     python -m training.train_text_to_latent \
         --filelist data/train.txt --root_dir data/wavs \
         --autoencoder_ckpt runs/autoencoder/ckpt_final.pt --out_dir runs/ttl
+
+Example (fine-tuning Supertone's real, pretrained text-to-latent module for a new
+language -- see training/README.md "Fine-tuning for a new language"):
+    python -m training.train_text_to_latent \
+        --filelist data/train.txt --root_dir data/wavs \
+        --config supertonic-3-model/onnx/tts.json \
+        --tokenizer runs/ported/tokenizer.json --autoencoder_ckpt runs/autoencoder_ft/ckpt_final.pt \
+        --init_ckpt runs/ported/ttl_ported.pt --out_dir runs/ttl_ft
 """
 from __future__ import annotations
 
@@ -19,7 +27,7 @@ from torch.utils.data import DataLoader
 
 from training.config import load_model_config
 from training.datasets import TextAudioDataset, load_filelist, text_audio_collate
-from training.latent_utils import ChannelNormalizer, compress_latent, sample_reference_crop
+from training.latent_utils import normalize_and_compress, sample_reference_crop
 from training.modules.autoencoder import SpeechAutoencoder
 from training.modules.layers import sequence_mask
 from training.modules.text_to_latent import TextToLatentModel, flow_matching_loss
@@ -39,11 +47,18 @@ def parse_args():
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--lr_halve_every", type=int, default=300_000)
     p.add_argument("--iters", type=int, default=700_000)
-    p.add_argument("--calibrate_batches", type=int, default=50, help="batches used to fit latent normalizer stats")
+    p.add_argument("--calibrate_batches", type=int, default=50, help="batches used to fit ae.latent_mean/std if not already fitted")
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--ckpt_every", type=int, default=5000)
     p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--resume", default=None)
+    p.add_argument("--resume", default=None, help="full training-state checkpoint to continue an interrupted run")
+    p.add_argument(
+        "--init_ckpt",
+        default=None,
+        help="warm-start model weights only (e.g. runs/ported/ttl_ported.pt from port_onnx_weights.py); "
+        "fresh optimizer/scheduler, step starts at 0. Ignored if --resume is set. The tokenizer used here "
+        "must match the one the checkpoint was ported/trained with (pass --tokenizer runs/ported/tokenizer.json).",
+    )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
@@ -58,13 +73,12 @@ def build_tokenizer(args) -> CharTokenizer:
 
 
 @torch.no_grad()
-def encode_batch(ae: SpeechAutoencoder, cfg, wav, wav_lengths, device):
+def encode_batch_raw(ae: SpeechAutoencoder, cfg, wav, wav_lengths, device):
+    """Returns the raw (uncompressed, un-normalized) 24-dim latent + frame lengths."""
     wav = wav.to(device)
-    latent = ae.encoder(wav)  # (B, ldim, T)
-    latent_lengths = (wav_lengths // cfg.ae.hop_length + 1).clamp(max=latent.shape[-1]).to(device)
-    z1 = compress_latent(latent, cfg.ttl.chunk_compress_factor)
-    z_lengths = (latent_lengths // cfg.ttl.chunk_compress_factor).clamp(min=1)
-    return z1, z_lengths
+    raw_latent = ae.encoder(wav)  # (B, ldim, T)
+    latent_lengths = (wav_lengths // cfg.ae.hop_length + 1).clamp(max=raw_latent.shape[-1]).to(device)
+    return raw_latent, latent_lengths
 
 
 def main():
@@ -96,7 +110,6 @@ def main():
     )
 
     model = TextToLatentModel(cfg.ttl, tokenizer.vocab_size).to(device)
-    normalizer = ChannelNormalizer(cfg.ttl.compressed_dim, cfg.ttl.normalizer_scale).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.StepLR(opt, step_size=args.lr_halve_every, gamma=0.5)
 
@@ -114,17 +127,19 @@ def main():
         model.load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["opt"])
         sched.load_state_dict(ckpt["sched"])
-        normalizer.load_state_dict(ckpt["normalizer"])
         step = ckpt["step"]
     else:
-        print(f"Calibrating latent normalizer over {args.calibrate_batches} batches...")
-        calib_latents = []
-        for _ in range(args.calibrate_batches):
-            wav, wav_lengths, _, _ = next(data_iter)
-            z1, _ = encode_batch(ae, cfg, wav, wav_lengths, device)
-            calib_latents.append(z1.cpu())
-        normalizer.fit(calib_latents)
-        print("Calibration done. mean/std shape:", normalizer.mean.shape)
+        if args.init_ckpt:
+            model.load_state_dict(torch.load(args.init_ckpt, map_location=device)["model"])
+        if not bool(ae.latent_stats_fitted):
+            print(f"ae.latent_mean/std not yet fitted; calibrating over {args.calibrate_batches} batches...")
+            calib_latents = []
+            for _ in range(args.calibrate_batches):
+                wav, wav_lengths, _, _ = next(data_iter)
+                raw_latent, _ = encode_batch_raw(ae, cfg, wav, wav_lengths, device)
+                calib_latents.append(raw_latent.cpu())
+            ae.fit_latent_stats(calib_latents)
+            print("Calibration done. mean/std shape:", ae.latent_mean.shape)
 
     model.train()
     while step < args.iters:
@@ -132,8 +147,9 @@ def main():
         text_padded = text_padded.to(device)
         text_mask = sequence_mask(text_lengths.to(device), text_padded.shape[1])
 
-        z1_raw, z_lengths = encode_batch(ae, cfg, wav, wav_lengths, device)
-        z1 = normalizer(z1_raw)
+        raw_latent, latent_lengths = encode_batch_raw(ae, cfg, wav, wav_lengths, device)
+        z1 = normalize_and_compress(ae, raw_latent, cfg.ttl.chunk_compress_factor, cfg.ttl.normalizer_scale)
+        z_lengths = (latent_lengths // cfg.ttl.chunk_compress_factor).clamp(min=1)
         latent_mask = sequence_mask(z_lengths, z1.shape[-1])
         ref_latent, ref_mask, ref_time_mask = sample_reference_crop(z1, z_lengths, frame_rate)
 
@@ -159,19 +175,13 @@ def main():
             print(f"step {step} | loss {loss.item():.4f} | lr {sched.get_last_lr()[0]:.2e}")
         if step > 0 and step % args.ckpt_every == 0:
             torch.save(
-                {
-                    "step": step,
-                    "model": model.state_dict(),
-                    "opt": opt.state_dict(),
-                    "sched": sched.state_dict(),
-                    "normalizer": normalizer.state_dict(),
-                },
+                {"step": step, "model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict()},
                 out_dir / f"ckpt_{step}.pt",
             )
         step += 1
 
     torch.save(
-        {"step": step, "model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(), "normalizer": normalizer.state_dict()},
+        {"step": step, "model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict()},
         out_dir / "ckpt_final.pt",
     )
 

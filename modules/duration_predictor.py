@@ -8,35 +8,39 @@ import torch
 import torch.nn as nn
 
 from training.config import DPConfig
-from training.modules.layers import ConvNeXtStack, SelfAttentionBlock, StyleTokenLayer
+from training.modules.layers import ConvNeXtStack, RelPosTransformerEncoder, StyleTokenLayer
 
 
 class DPTextEncoder(nn.Module):
-    """Sentence encoder: char ids -> prepended learnable utterance token -> ConvNeXt
-    + self-attention -> the utterance token's output is the fixed-size text embedding.
+    """Sentence encoder: char ids -> prepended learnable "sentence token" -> ConvNeXt
+    + relative-position self-attention -> the sentence token's output is the
+    fixed-size text embedding (Appendix A.3.2; self-attention scheme corrected
+    per the ground-truth ONNX graph, see training/README.md).
     """
 
     def __init__(self, cfg: DPConfig, vocab_size: int):
         super().__init__()
         dim = cfg.char_emb_dim
-        self.embed = nn.Embedding(vocab_size, dim, padding_idx=0)
-        self.utt_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        # see TextEncoder in text_to_latent.py: no padding_idx, ported vocab id 0 is a real char
+        self.embed = nn.Embedding(vocab_size, dim)
+        self.sentence_token = nn.Parameter(torch.randn(1, dim, 1) * 0.02)
         self.convnext = ConvNeXtStack(dim, cfg.convnext_interm, cfg.convnext_ksz, (1,) * cfg.convnext_layers)
-        self.self_attn = nn.ModuleList(
-            [SelfAttentionBlock(dim, cfg.attn_heads, cfg.attn_filter) for _ in range(cfg.attn_layers)]
-        )
-        self.proj_out = nn.Linear(dim, dim)
+        self.attn_encoder = RelPosTransformerEncoder(dim, cfg.attn_filter, cfg.attn_heads, cfg.attn_layers)
+        self.proj_out = nn.Linear(dim, dim, bias=False)  # ground truth: duration_predictor.onnx has no bias here
 
     def forward(self, text_ids: torch.Tensor, text_mask: torch.Tensor) -> torch.Tensor:
+        # ground truth (duration_predictor.onnx "/sentence_encoder/Add"): same outer
+        # residual as TextEncoder in text_to_latent.py -- the ConvNeXt stack's output is
+        # added back in after the self-attention block, then position 0 (the sentence
+        # token) is sliced out and proj_out'd.
         b = text_ids.shape[0]
         x = self.embed(text_ids).transpose(1, 2)  # (B, C, T)
-        utt = self.utt_token.expand(b, -1, -1).transpose(1, 2)  # (B, C, 1)
-        x = torch.cat([utt, x], dim=2)
+        token = self.sentence_token.expand(b, -1, -1)  # (B, C, 1)
+        x = torch.cat([token, x], dim=2)
         mask = torch.cat([torch.ones(b, 1, 1, device=text_mask.device), text_mask], dim=2)
-        x = self.convnext(x, mask)
-        for attn in self.self_attn:
-            x = attn(x, mask)
-        utt_out = x[:, :, 0]
+        x_cn = self.convnext(x, mask)
+        x_sa = self.attn_encoder(x_cn, mask)
+        utt_out = (x_sa + x_cn)[:, :, 0]
         return self.proj_out(utt_out)
 
 
@@ -74,14 +78,19 @@ class DurationPredictor(nn.Module):
         self.style_encoder = DPStyleEncoder(cfg)
         in_dim = cfg.char_emb_dim + cfg.n_style * cfg.style_value_dim
         self.estimator = nn.Sequential(
-            nn.Linear(in_dim, cfg.predictor_hdim), nn.PReLU(cfg.predictor_hdim), nn.Linear(cfg.predictor_hdim, 1)
+            nn.Linear(in_dim, cfg.predictor_hdim), nn.PReLU(), nn.Linear(cfg.predictor_hdim, 1)
         )
 
     def forward(self, text_ids, text_mask, ref_latent, ref_mask=None) -> torch.Tensor:
+        # ground truth (duration_predictor.onnx /predictor/Concat_2 + /predictor/Exp):
+        # text embedding comes first in the concat (not style/ref), and the estimator
+        # predicts LOG-duration -- exponentiated here to return actual seconds, matching
+        # what train_duration_predictor.py's target_duration and duration_loss expect.
         text_emb = self.text_encoder(text_ids, text_mask)
         ref_emb = self.style_encoder(ref_latent, ref_mask)
-        x = torch.cat([ref_emb, text_emb], dim=-1)
-        return self.estimator(x).squeeze(-1)
+        x = torch.cat([text_emb, ref_emb], dim=-1)
+        log_duration = self.estimator(x).squeeze(-1)
+        return log_duration.exp()
 
 
 def duration_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

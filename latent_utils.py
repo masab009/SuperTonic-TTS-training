@@ -28,32 +28,20 @@ def decompress_latent(latent: torch.Tensor, kc: int, ldim: int) -> torch.Tensor:
     return latent
 
 
-class ChannelNormalizer(torch.nn.Module):
-    """Precomputed channel-wise mean/std normalization with an extra global scale
-    factor (`ttl.normalizer.scale` / `dp.normalizer.scale` in the released config).
-    Call `fit` once on a sample of training latents before training starts.
+def normalize_and_compress(ae, raw_latent: torch.Tensor, kc: int, scale: float) -> torch.Tensor:
+    """Ground-truth normalization order (from vocoder.onnx's `ae.latent_mean`/
+    `ae.latent_std` + `ttl.normalizer.scale`): normalize the *raw* 24-dim latent
+    with the autoencoder's shared per-channel stats, THEN temporally compress,
+    THEN apply the stage's own scalar multiplier. `ae` is a SpeechAutoencoder.
     """
+    normalized = ae.normalize_latent(raw_latent)
+    compressed = compress_latent(normalized, kc)
+    return compressed * scale
 
-    def __init__(self, num_channels: int, scale: float = 1.0):
-        super().__init__()
-        self.scale = scale
-        self.register_buffer("mean", torch.zeros(1, num_channels, 1))
-        self.register_buffer("std", torch.ones(1, num_channels, 1))
-        self.register_buffer("fitted", torch.tensor(False))
 
-    @torch.no_grad()
-    def fit(self, latents: list[torch.Tensor]) -> None:
-        # each latent: (B, C, T) -> (C, B*T), pooled across batches to get per-channel stats
-        flat = torch.cat([lat.transpose(0, 1).reshape(lat.shape[1], -1) for lat in latents], dim=1)
-        self.mean.copy_(flat.mean(dim=1).view(1, -1, 1))
-        self.std.copy_(flat.std(dim=1).clamp_min(1e-5).view(1, -1, 1))
-        self.fitted.fill_(True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return (x - self.mean) / self.std * self.scale
-
-    def inverse(self, x: torch.Tensor) -> torch.Tensor:
-        return x / self.scale * self.std + self.mean
+def decompress_and_denormalize(ae, compressed: torch.Tensor, kc: int, ldim: int, scale: float) -> torch.Tensor:
+    normalized = decompress_latent(compressed / scale, kc, ldim)
+    return ae.denormalize_latent(normalized)
 
 
 def sample_reference_crop(

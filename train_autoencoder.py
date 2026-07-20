@@ -1,8 +1,16 @@
 """Stage 1: train the speech autoencoder (Section 3.1, Section 4.2).
 
-Example:
+Example (training from scratch):
     python -m training.train_autoencoder \
         --filelist data/train.txt --root_dir data/wavs --out_dir runs/autoencoder
+
+Example (fine-tuning a new encoder against Supertone's real, pretrained decoder --
+see training/README.md "Fine-tuning for a new language"):
+    python -m training.port_onnx_weights --onnx_dir supertonic-3-model/onnx --out_dir runs/ported
+    python -m training.train_autoencoder \
+        --filelist data/train.txt --root_dir data/wavs --out_dir runs/autoencoder_ft \
+        --config supertonic-3-model/onnx/tts.json \
+        --init_ckpt runs/ported/autoencoder_ported.pt --freeze_decoder
 """
 from __future__ import annotations
 
@@ -40,7 +48,25 @@ def parse_args():
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--ckpt_every", type=int, default=5000)
     p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--resume", default=None)
+    p.add_argument("--resume", default=None, help="full training-state checkpoint to continue an interrupted run")
+    p.add_argument(
+        "--init_ckpt",
+        default=None,
+        help="warm-start generator weights only (e.g. runs/ported/autoencoder_ported.pt from "
+        "port_onnx_weights.py); fresh optimizer/discriminators, step starts at 0. Ignored if --resume is set.",
+    )
+    p.add_argument(
+        "--freeze_decoder",
+        action="store_true",
+        help="keep the decoder fixed and only train the encoder, e.g. to fine-tune a new encoder "
+        "against Supertone's real (ported) decoder for a new language. Requires --init_ckpt or --resume.",
+    )
+    p.add_argument(
+        "--calibrate_batches",
+        type=int,
+        default=50,
+        help="batches used to refit generator.latent_mean/std from the final encoder before saving ckpt_final.pt",
+    )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
@@ -84,20 +110,34 @@ def main():
     mrd = MultiResolutionDiscriminator().to(device)
     mel_loss_fn = MultiResolutionMelLoss(cfg.ae.sample_rate).to(device)
 
-    opt_g = torch.optim.AdamW(generator.parameters(), lr=args.lr, betas=(0.8, 0.99))
-    opt_d = torch.optim.AdamW(
-        list(mpd.parameters()) + list(mrd.parameters()), lr=args.lr, betas=(0.8, 0.99)
-    )
-
     step = 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
         generator.load_state_dict(ckpt["generator"])
         mpd.load_state_dict(ckpt["mpd"])
         mrd.load_state_dict(ckpt["mrd"])
+        step = ckpt["step"]
+    elif args.init_ckpt:
+        generator.load_state_dict(torch.load(args.init_ckpt, map_location=device)["generator"])
+        # loaded stats (if any) describe whatever encoder produced them, not this run's encoder --
+        # always recomputed from the actual trained encoder before saving ckpt_final.pt below.
+        generator.latent_stats_fitted.fill_(False)
+
+    if args.freeze_decoder:
+        if not (args.resume or args.init_ckpt):
+            print("warning: --freeze_decoder with a randomly-initialized decoder; pass --init_ckpt "
+                  "with a ported checkpoint to freeze a real, pretrained decoder instead.")
+        for p in generator.decoder.parameters():
+            p.requires_grad_(False)
+
+    trainable_g_params = [p for p in generator.parameters() if p.requires_grad]
+    opt_g = torch.optim.AdamW(trainable_g_params, lr=args.lr, betas=(0.8, 0.99))
+    opt_d = torch.optim.AdamW(
+        list(mpd.parameters()) + list(mrd.parameters()), lr=args.lr, betas=(0.8, 0.99)
+    )
+    if args.resume:
         opt_g.load_state_dict(ckpt["opt_g"])
         opt_d.load_state_dict(ckpt["opt_d"])
-        step = ckpt["step"]
 
     def infinite(loader):
         while True:
@@ -153,6 +193,15 @@ def main():
             save_ckpt(out_dir / f"ckpt_{step}.pt", step, generator, mpd, mrd, opt_g, opt_d)
 
         step += 1
+
+    print(f"Refitting latent_mean/std over {args.calibrate_batches} batches before saving ckpt_final.pt...")
+    generator.eval()
+    calib_latents = []
+    with torch.no_grad():
+        for _ in range(args.calibrate_batches):
+            wav = next(data_iter).to(device)
+            calib_latents.append(generator.encoder(wav).cpu())
+    generator.fit_latent_stats(calib_latents)
 
     save_ckpt(out_dir / "ckpt_final.pt", step, generator, mpd, mrd, opt_g, opt_d)
 

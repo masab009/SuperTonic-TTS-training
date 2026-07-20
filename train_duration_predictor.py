@@ -7,6 +7,14 @@ Example:
         --filelist data/train.txt --root_dir data/wavs \
         --autoencoder_ckpt runs/autoencoder/ckpt_final.pt \
         --tokenizer runs/ttl/tokenizer.json --out_dir runs/dp
+
+Example (fine-tuning Supertone's real, pretrained duration predictor for a new
+language -- see training/README.md "Fine-tuning for a new language"):
+    python -m training.train_duration_predictor \
+        --filelist data/train.txt --root_dir data/wavs \
+        --config supertonic-3-model/onnx/tts.json \
+        --tokenizer runs/ported/tokenizer.json --autoencoder_ckpt runs/autoencoder_ft/ckpt_final.pt \
+        --init_ckpt runs/ported/dp_ported.pt --out_dir runs/dp_ft
 """
 from __future__ import annotations
 
@@ -19,7 +27,7 @@ from torch.utils.data import DataLoader
 
 from training.config import load_model_config
 from training.datasets import TextAudioDataset, load_filelist, text_audio_collate
-from training.latent_utils import ChannelNormalizer, compress_latent
+from training.latent_utils import normalize_and_compress
 from training.modules.autoencoder import SpeechAutoencoder
 from training.modules.duration_predictor import DurationPredictor, duration_loss
 from training.modules.layers import sequence_mask
@@ -42,6 +50,14 @@ def parse_args():
     p.add_argument("--log_every", type=int, default=20)
     p.add_argument("--ckpt_every", type=int, default=500)
     p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--resume", default=None, help="full training-state checkpoint to continue an interrupted run")
+    p.add_argument(
+        "--init_ckpt",
+        default=None,
+        help="warm-start model weights only (e.g. runs/ported/dp_ported.pt from port_onnx_weights.py); "
+        "fresh optimizer, step starts at 0. Ignored if --resume is set. The tokenizer used here must match "
+        "the one the checkpoint was ported/trained with (pass --tokenizer runs/ported/tokenizer.json).",
+    )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
@@ -71,13 +87,11 @@ def sample_dp_reference(z1: torch.Tensor, lengths: torch.Tensor):
 
 
 @torch.no_grad()
-def encode_batch(ae: SpeechAutoencoder, cfg, wav, wav_lengths, device):
+def encode_batch_raw(ae: SpeechAutoencoder, cfg, wav, wav_lengths, device):
     wav = wav.to(device)
-    latent = ae.encoder(wav)
-    latent_lengths = (wav_lengths // cfg.ae.hop_length + 1).clamp(max=latent.shape[-1]).to(device)
-    z1 = compress_latent(latent, cfg.dp.chunk_compress_factor)
-    z_lengths = (latent_lengths // cfg.dp.chunk_compress_factor).clamp(min=1)
-    return z1, z_lengths
+    raw_latent = ae.encoder(wav)
+    latent_lengths = (wav_lengths // cfg.ae.hop_length + 1).clamp(max=raw_latent.shape[-1]).to(device)
+    return raw_latent, latent_lengths
 
 
 def main():
@@ -112,7 +126,6 @@ def main():
     )
 
     model = DurationPredictor(cfg.dp, tokenizer.vocab_size).to(device)
-    normalizer = ChannelNormalizer(cfg.dp.compressed_dim, cfg.dp.normalizer_scale).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     def infinite(loader):
@@ -121,22 +134,33 @@ def main():
 
     data_iter = infinite(loader)
 
-    print(f"Calibrating latent normalizer over {args.calibrate_batches} batches...")
-    calib_latents = []
-    for _ in range(args.calibrate_batches):
-        wav, wav_lengths, _, _ = next(data_iter)
-        z1, _ = encode_batch(ae, cfg, wav, wav_lengths, device)
-        calib_latents.append(z1.cpu())
-    normalizer.fit(calib_latents)
+    step = 0
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        opt.load_state_dict(ckpt["opt"])
+        step = ckpt["step"]
+    else:
+        if args.init_ckpt:
+            model.load_state_dict(torch.load(args.init_ckpt, map_location=device)["model"])
+        if not bool(ae.latent_stats_fitted):
+            print(f"ae.latent_mean/std not yet fitted; calibrating over {args.calibrate_batches} batches...")
+            calib_latents = []
+            for _ in range(args.calibrate_batches):
+                wav, wav_lengths, _, _ = next(data_iter)
+                raw_latent, _ = encode_batch_raw(ae, cfg, wav, wav_lengths, device)
+                calib_latents.append(raw_latent.cpu())
+            ae.fit_latent_stats(calib_latents)
 
     model.train()
-    for step in range(args.iters):
+    while step < args.iters:
         wav, wav_lengths, text_padded, text_lengths = next(data_iter)
         text_padded = text_padded.to(device)
         text_mask = sequence_mask(text_lengths.to(device), text_padded.shape[1])
 
-        z1_raw, z_lengths = encode_batch(ae, cfg, wav, wav_lengths, device)
-        z1 = normalizer(z1_raw)
+        raw_latent, latent_lengths = encode_batch_raw(ae, cfg, wav, wav_lengths, device)
+        z1 = normalize_and_compress(ae, raw_latent, cfg.dp.chunk_compress_factor, cfg.dp.normalizer_scale)
+        z_lengths = (latent_lengths // cfg.dp.chunk_compress_factor).clamp(min=1)
         ref_latent, ref_mask = sample_dp_reference(z1, z_lengths)
 
         target_duration = (wav_lengths.float() / cfg.ae.sample_rate).to(device)
@@ -150,15 +174,11 @@ def main():
         if step % args.log_every == 0:
             print(f"step {step} | L1 {loss.item():.4f}s")
         if step > 0 and step % args.ckpt_every == 0:
-            torch.save(
-                {"step": step, "model": model.state_dict(), "opt": opt.state_dict(), "normalizer": normalizer.state_dict()},
-                out_dir / f"ckpt_{step}.pt",
-            )
+            torch.save({"step": step, "model": model.state_dict(), "opt": opt.state_dict()}, out_dir / f"ckpt_{step}.pt")
 
-    torch.save(
-        {"step": args.iters, "model": model.state_dict(), "opt": opt.state_dict(), "normalizer": normalizer.state_dict()},
-        out_dir / "ckpt_final.pt",
-    )
+        step += 1
+
+    torch.save({"step": step, "model": model.state_dict(), "opt": opt.state_dict()}, out_dir / "ckpt_final.pt")
 
 
 if __name__ == "__main__":

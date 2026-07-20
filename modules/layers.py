@@ -27,6 +27,12 @@ class ConvNeXtBlock1D(nn.Module):
 
     depthwise conv -> LayerNorm -> pointwise up -> GELU -> pointwise down -> layerscale -> residual.
     `causal=True` left-pads only (no future leakage), used by the streaming latent decoder.
+
+    Ground-truth confirmed against text_encoder.onnx's `convnext.0.*` node graph: masking
+    happens THREE times per block (input, post-dwconv, post-residual), and the residual
+    branch is the *masked* input, not the raw one -- masking here, not just once per block
+    from the outside (as `ConvNeXtStack` used to), matters whenever `mask` excludes any
+    position (i.e. always, once real batches have padding).
     """
 
     def __init__(
@@ -52,10 +58,14 @@ class ConvNeXtBlock1D(nn.Module):
         self.pwconv2 = nn.Linear(intermediate_dim, dim)
         self.gamma = nn.Parameter(layer_scale_init_value * torch.ones(dim))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        x = x * mask if mask is not None else x
         residual = x
-        x = F.pad(x, (self.left_pad, self.right_pad))
+        # ground truth (every graph's dwconv Pad node): edge/replicate padding, not zero
+        x = F.pad(x, (self.left_pad, self.right_pad), mode="replicate")
         x = self.dwconv(x)
+        if mask is not None:
+            x = x * mask
         x = x.transpose(1, 2)  # (B, T, C)
         x = self.norm(x)
         x = self.pwconv1(x)
@@ -63,7 +73,8 @@ class ConvNeXtBlock1D(nn.Module):
         x = self.pwconv2(x)
         x = self.gamma * x
         x = x.transpose(1, 2)  # (B, C, T)
-        return residual + x
+        out = residual + x
+        return out * mask if mask is not None else out
 
 
 class ConvNeXtStack(nn.Module):
@@ -78,9 +89,7 @@ class ConvNeXtStack(nn.Module):
 
     def forward(self, x, mask: torch.Tensor | None = None):
         for block in self.blocks:
-            x = block(x)
-            if mask is not None:
-                x = x * mask
+            x = block(x, mask)
         return x
 
 
@@ -179,27 +188,210 @@ class Attention(nn.Module):
         return out.transpose(1, 2)
 
 
-class SelfAttentionBlock(nn.Module):
-    """Pre-norm self-attention + residual, transformer-encoder style, used by the
-    text encoder / DP text encoder ("attn_encoder" in the released config)."""
+def _convert_pad_shape(pad_shape: list[list[int]]) -> list[int]:
+    return [item for sublist in reversed(pad_shape) for item in sublist]
 
-    def __init__(self, dim: int, n_heads: int, filter_channels: int, p_dropout: float = 0.0, rotary_base: float = 10000.0):
+
+class RelativePositionSelfAttention(nn.Module):
+    """Windowed relative-position multi-head self-attention (Shaw et al. 2018),
+    as implemented in VITS/Glow-TTS's `attentions.py`. Confirmed (not guessed) as
+    the released model's actual self-attention mechanism by inspecting the
+    `text_encoder.onnx` / `duration_predictor.onnx` graphs: parameters are named
+    `conv_q/conv_k/conv_v/conv_o` (Conv1d, kernel 1) plus a pair of learnable
+    relative position embeddings `emb_rel_k`/`emb_rel_v` of shape
+    (1, 2*window_size+1, head_dim) -- the paper's text says "rotary position
+    embedding", but the shipped weights are unambiguously this scheme instead.
+    """
+
+    def __init__(self, channels: int, n_heads: int, window_size: int = 4, p_dropout: float = 0.0):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = Attention(dim, dim, n_heads, rotary_base=rotary_base, p_dropout=p_dropout)
-        self.norm2 = nn.LayerNorm(dim)
-        self.ff = nn.Sequential(
-            nn.Linear(dim, filter_channels), nn.GELU(), nn.Dropout(p_dropout), nn.Linear(filter_channels, dim)
-        )
+        assert channels % n_heads == 0
+        self.n_heads = n_heads
+        self.k_channels = channels // n_heads
+        self.window_size = window_size
+
+        self.conv_q = nn.Conv1d(channels, channels, 1)
+        self.conv_k = nn.Conv1d(channels, channels, 1)
+        self.conv_v = nn.Conv1d(channels, channels, 1)
+        self.conv_o = nn.Conv1d(channels, channels, 1)
+        self.drop = nn.Dropout(p_dropout)
+
+        rel_stddev = self.k_channels ** -0.5
+        self.emb_rel_k = nn.Parameter(torch.randn(1, 2 * window_size + 1, self.k_channels) * rel_stddev)
+        self.emb_rel_v = nn.Parameter(torch.randn(1, 2 * window_size + 1, self.k_channels) * rel_stddev)
+
+    def _get_relative_embeddings(self, emb: torch.Tensor, length: int) -> torch.Tensor:
+        pad_length = max(length - (self.window_size + 1), 0)
+        start = max((self.window_size + 1) - length, 0)
+        end = start + 2 * length - 1
+        if pad_length > 0:
+            emb = F.pad(emb, _convert_pad_shape([[0, 0], [pad_length, pad_length], [0, 0]]))
+        return emb[:, start:end]
+
+    def _relative_to_absolute(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, H, L, 2L-1) -> (B, H, L, L)
+        b, h, length, _ = x.shape
+        x = F.pad(x, _convert_pad_shape([[0, 0], [0, 0], [0, 0], [0, 1]]))
+        x_flat = x.view(b, h, length * 2 * length)
+        x_flat = F.pad(x_flat, _convert_pad_shape([[0, 0], [0, 0], [0, length - 1]]))
+        return x_flat.view(b, h, length + 1, 2 * length - 1)[:, :, :length, length - 1 :]
+
+    def _absolute_to_relative(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, H, L, L) -> (B, H, L, 2L-1)
+        b, h, length, _ = x.shape
+        x = F.pad(x, _convert_pad_shape([[0, 0], [0, 0], [0, 0], [0, length - 1]]))
+        x_flat = x.view(b, h, length**2 + length * (length - 1))
+        x_flat = F.pad(x_flat, _convert_pad_shape([[0, 0], [0, 0], [length, 0]]))
+        return x_flat.view(b, h, length, 2 * length)[:, :, :, 1:]
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        h = self.norm1(x.transpose(1, 2)).transpose(1, 2)
-        x = x + self.attn(h, h, mask=mask)
-        h = self.norm2(x.transpose(1, 2)).transpose(1, 2)
-        x = x + self.ff(h.transpose(1, 2)).transpose(1, 2)
+        """x: (B, C, T). mask: (B, 1, T) with 1=valid. Returns (B, C, T)."""
+        b, c, t = x.shape
+        q = self.conv_q(x).view(b, self.n_heads, self.k_channels, t).transpose(2, 3)
+        k = self.conv_k(x).view(b, self.n_heads, self.k_channels, t).transpose(2, 3)
+        v = self.conv_v(x).view(b, self.n_heads, self.k_channels, t).transpose(2, 3)
+
+        # ground truth (VITS/Glow-TTS MultiHeadAttention.attention): the query is scaled
+        # ONCE and reused for both the main and relative-position score matmuls -- scaling
+        # only the main scores (leaving rel_logits unscaled) was a real bug, not a harmless
+        # reordering: it made the relative-position term sqrt(k_channels) times too large.
+        q_scaled = q / math.sqrt(self.k_channels)
+        scores = torch.matmul(q_scaled, k.transpose(-2, -1))
+        rel_k = self._get_relative_embeddings(self.emb_rel_k, t)
+        rel_logits = torch.matmul(q_scaled, rel_k.unsqueeze(0).transpose(-2, -1))
+        scores = scores + self._relative_to_absolute(rel_logits)
+
         if mask is not None:
-            x = x * mask
+            key_mask = mask.unsqueeze(1)  # (B, 1, 1, T)
+            scores = scores.masked_fill(key_mask < 0.5, float("-inf"))
+
+        attn = F.softmax(scores, dim=-1)
+        attn = self.drop(attn)
+        rel_v = self._get_relative_embeddings(self.emb_rel_v, t)
+        rel_weights = self._absolute_to_relative(attn)
+        out = torch.matmul(attn, v) + torch.matmul(rel_weights, rel_v.unsqueeze(0))
+        out = out.transpose(2, 3).reshape(b, c, t)
+        return self.conv_o(out)
+
+
+class ChannelLayerNorm(nn.Module):
+    """LayerNorm over the channel dim of a (B, C, T) tensor, wrapped so the
+    parameter path is `<name>.norm.weight` (matching the released naming)."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x.transpose(1, 2)).transpose(1, 2)
+
+
+class RelPosTransformerEncoder(nn.Module):
+    """Self-attention stack matching `<...>.attn_encoder` in the released config:
+    alternating relative-position self-attention and a conv-FFN, each with its own
+    post-norm (VITS/Glow-TTS `Encoder`, confirmed against text_encoder.onnx's
+    `attn_layers` / `norm_layers_1` / `ffn_layers` / `norm_layers_2` parameter names).
+    """
+
+    def __init__(self, dim: int, filter_channels: int, n_heads: int, n_layers: int, window_size: int = 4, p_dropout: float = 0.0):
+        super().__init__()
+        self.attn_layers = nn.ModuleList(
+            [RelativePositionSelfAttention(dim, n_heads, window_size, p_dropout) for _ in range(n_layers)]
+        )
+        self.norm_layers_1 = nn.ModuleList([ChannelLayerNorm(dim) for _ in range(n_layers)])
+        self.ffn_layers = nn.ModuleList(
+            [nn.ModuleDict({"conv_1": nn.Conv1d(dim, filter_channels, 1), "conv_2": nn.Conv1d(filter_channels, dim, 1)}) for _ in range(n_layers)]
+        )
+        self.norm_layers_2 = nn.ModuleList([ChannelLayerNorm(dim) for _ in range(n_layers)])
+        self.drop = nn.Dropout(p_dropout)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        for attn, norm1, ffn, norm2 in zip(self.attn_layers, self.norm_layers_1, self.ffn_layers, self.norm_layers_2):
+            y = attn(x, mask)
+            x = norm1(x + self.drop(y))
+            # VITS/Glow-TTS FFN: mask before each conv, ReLU (not GELU) -- ground-truth
+            # confirmed against text_encoder.onnx's ffn_layers.* node ops (Conv/Relu/Conv,
+            # each preceded by a Mul against text_mask).
+            x_in = x * mask if mask is not None else x
+            y = F.relu(ffn["conv_1"](x_in))
+            y = y * mask if mask is not None else y
+            y = ffn["conv_2"](y)
+            x = norm2(x + self.drop(y))
+            if mask is not None:
+                x = x * mask
         return x
+
+
+class XWLinear(nn.Module):
+    """Linear layer storing its weight as (in, out) and computing `x @ W + b`,
+    matching the released model's projection convention (as opposed to
+    PyTorch's `nn.Linear`, which stores (out, in) and computes `x @ W^T + b`).
+    Using this convention lets ONNX weights be copied in directly, unmodified.
+    """
+
+    def __init__(self, in_dim: int, out_dim: int, bias: bool = True):
+        super().__init__()
+        self.linear = nn.Linear(in_dim, out_dim, bias=bias)
+        # re-parameterize storage as (in, out) instead of nn.Linear's (out, in)
+        del self.linear.weight
+        self.linear.weight = nn.Parameter(torch.empty(in_dim, out_dim))
+        nn.init.kaiming_uniform_(self.linear.weight, a=math.sqrt(5))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = x @ self.linear.weight
+        if self.linear.bias is not None:
+            out = out + self.linear.bias
+        return out
+
+
+class ConditionCrossAttention(nn.Module):
+    """Cross-attention from a (B, C, T) stream onto a shared fixed-length context
+    (e.g. the 50-token style_ttl), independently re-projected into K and V by this
+    layer's own W_key/W_value (ground-truth confirmed by tracing
+    vector_estimator.onnx's `main_blocks.*.attention` node graph). Two variants
+    observed there: `tanh_score=True` bounds the key with tanh before the score
+    matmul (used for style/reference conditioning); mask, if given, zeroes
+    attention weights *after* softmax rather than biasing logits beforehand
+    (also matched from the traced graph, not a standard pre-softmax mask).
+    """
+
+    def __init__(self, x_dim: int, ctx_dim: int, n_heads: int, hidden: int | None = None, tanh_score: bool = True):
+        super().__init__()
+        hidden = hidden or ctx_dim
+        assert hidden % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = hidden // n_heads
+        self.hidden = hidden
+        self.tanh_score = tanh_score
+
+        self.W_query = XWLinear(x_dim, hidden)
+        self.W_key = XWLinear(ctx_dim, hidden)
+        self.W_value = XWLinear(ctx_dim, hidden)
+        self.out_fc = XWLinear(hidden, x_dim)
+
+    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, _ = x.shape
+        return x.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
+
+    def forward(self, x: torch.Tensor, ctx: torch.Tensor, ctx_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """x: (B, C_x, T). ctx: (B, T_ctx, C_ctx) channels-last. Returns (B, C_x, T)."""
+        q = self._split_heads(self.W_query(x.transpose(1, 2)))
+        k = self._split_heads(self.W_key(ctx))
+        v = self._split_heads(self.W_value(ctx))
+
+        key = torch.tanh(k) if self.tanh_score else k
+        # ground truth (vector_estimator.onnx / text_encoder.onnx Div constant): scaled by
+        # sqrt(hidden) -- the full pre-split projection width -- not sqrt(head_dim); this
+        # module's multi-head split isn't a standard scaled-dot-product-attention scaling.
+        scores = torch.matmul(q, key.transpose(-2, -1)) / math.sqrt(self.hidden)
+        attn = F.softmax(scores, dim=-1)
+        if ctx_mask is not None:
+            attn = attn.masked_fill(ctx_mask.view(x.shape[0], 1, 1, -1) < 0.5, 0.0)
+
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).reshape(x.shape[0], -1, self.n_heads * self.head_dim)
+        out = self.out_fc(out)
+        return out.transpose(1, 2)
 
 
 class StyleTokenLayer(nn.Module):
@@ -230,8 +422,12 @@ class StyleTokenLayer(nn.Module):
         self.value_query = nn.Parameter(torch.randn(1, n_style, prototype_dim) * 0.02)
         key_out = (style_key_dim // n_style) if flatten_output and style_key_dim else style_key_dim
         val_out = (style_value_dim // n_style) if flatten_output else style_value_dim
-        self.key_attn = Attention(prototype_dim, input_dim, n_heads, n_units=n_units, p_dropout=0.0)
-        self.key_proj = nn.Linear(prototype_dim, key_out) if key_out else None
+        if key_out:
+            self.key_attn = Attention(prototype_dim, input_dim, n_heads, n_units=n_units, p_dropout=0.0)
+            self.key_proj = nn.Linear(prototype_dim, key_out)
+        else:
+            self.key_attn = None
+            self.key_proj = None
         self.value_attn = Attention(prototype_dim, input_dim, n_heads, n_units=n_units, p_dropout=0.0)
         self.value_proj = nn.Linear(prototype_dim, val_out)
 
@@ -257,10 +453,17 @@ class StyleTokenLayer(nn.Module):
 
 
 class SinusoidalTimeEmbedding(nn.Module):
+    """Grad-TTS-style time embedding: sinusoidal features at `dim`, expanded to
+    `hidden_dim` and projected back down to `dim` (ground-truth confirmed against
+    vector_estimator.onnx's `time_encoder.mlp.{0,2}` shapes -- output stays at
+    `dim`, NOT `hidden_dim`; each VFBlock's own `time_linear` does the actual
+    projection up to the model's channel width).
+    """
+
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
         self.dim = dim
-        self.mlp = nn.Sequential(nn.Linear(dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+        self.mlp = nn.Sequential(nn.Linear(dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, dim))
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         half = self.dim // 2

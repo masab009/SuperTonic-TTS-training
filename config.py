@@ -71,6 +71,9 @@ class TTLConfig:
     style_convnext_ksz: int = 5
     n_style: int = 50
     style_heads: int = 2
+    speech_prompted_heads: int = 2  # speech_prompted_text_encoder cross-attn (text <- style_ttl)
+    vf_style_heads: int = 2  # style-conditioning cross-attn inside the VF estimator
+    self_attn_window_size: int = 4  # windowed relative-position self-attention
 
     vf_hdim: int = 256
     vf_interm: int = 1024
@@ -84,6 +87,7 @@ class TTLConfig:
     vf_rotary_base: float = 10000.0
     vf_rotary_scale: float = 10.0
     time_dim: int = 64
+    time_hdim: int = 256  # SinusoidalTimeEmbedding's internal expand-then-contract width (Grad-TTS style)
 
     @property
     def compressed_dim(self) -> int:
@@ -177,6 +181,7 @@ def load_model_config(path: str | None) -> ModelConfig:
     ttl.style_convnext_interm = _get(raw, "ttl.style_encoder.convnext.intermediate_dim", ttl.style_convnext_interm)
     ttl.n_style = _get(raw, "ttl.style_encoder.style_token_layer.n_style", ttl.n_style)
     ttl.style_heads = _get(raw, "ttl.style_encoder.style_token_layer.n_heads", ttl.style_heads)
+    ttl.speech_prompted_heads = _get(raw, "ttl.speech_prompted_text_encoder.n_heads", ttl.speech_prompted_heads)
 
     ttl.vf_hdim = _get(raw, "ttl.vector_field.proj_in.odim", ttl.vf_hdim)
     ttl.vf_interm = _get(raw, "ttl.vector_field.main_blocks.convnext_0.intermediate_dim", ttl.vf_interm)
@@ -189,6 +194,7 @@ def load_model_config(path: str | None) -> ModelConfig:
     ttl.vf_rotary_base = _get(raw, "ttl.vector_field.main_blocks.text_cond_layer.rotary_base", ttl.vf_rotary_base)
     ttl.vf_rotary_scale = _get(raw, "ttl.vector_field.main_blocks.text_cond_layer.rotary_scale", ttl.vf_rotary_scale)
     ttl.time_dim = _get(raw, "ttl.vector_field.time_encoder.time_dim", ttl.time_dim)
+    ttl.time_hdim = _get(raw, "ttl.vector_field.time_encoder.hdim", ttl.time_hdim)
 
     dp.latent_dim = _get(raw, "dp.latent_dim", dp.latent_dim)
     dp.chunk_compress_factor = _get(raw, "dp.chunk_compress_factor", dp.chunk_compress_factor)
