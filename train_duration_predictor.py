@@ -25,6 +25,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
+from training.ckpt_utils import load_state_dict_grow_vocab
 from training.config import load_model_config
 from training.datasets import TextAudioDataset, load_filelist, text_audio_collate
 from training.latent_utils import normalize_and_compress
@@ -142,7 +143,7 @@ def main():
         step = ckpt["step"]
     else:
         if args.init_ckpt:
-            model.load_state_dict(torch.load(args.init_ckpt, map_location=device)["model"])
+            load_state_dict_grow_vocab(model, torch.load(args.init_ckpt, map_location=device)["model"])
         if not bool(ae.latent_stats_fitted):
             print(f"ae.latent_mean/std not yet fitted; calibrating over {args.calibrate_batches} batches...")
             calib_latents = []

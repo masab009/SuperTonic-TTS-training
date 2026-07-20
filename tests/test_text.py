@@ -50,3 +50,25 @@ def test_tokenizer_to_dict_from_dict_round_trip():
 def test_vocab_size_includes_pad():
     tok = CharTokenizer(char2id={"a": 1, "b": 2})
     assert tok.vocab_size == 3
+
+
+def test_extend_with_texts_preserves_existing_ids():
+    base = CharTokenizer.build_from_texts(["hello"], ["en"])
+    base_ids = dict(base.char2id)
+    extended = base.extend_with_texts(["hello world"], ["en"])
+    for c, i in base_ids.items():
+        assert extended.char2id[c] == i
+
+
+def test_extend_with_texts_appends_new_chars_after_existing_max():
+    base = CharTokenizer.build_from_texts(["ab"], ["en"])
+    old_max = max(base.char2id.values())
+    extended = base.extend_with_texts(["abz"], ["en"])
+    assert extended.char2id["z"] > old_max
+    assert extended.vocab_size == base.vocab_size + 1
+
+
+def test_extend_with_texts_no_new_chars_is_noop_on_ids():
+    base = CharTokenizer.build_from_texts(["hello"], ["en"])
+    extended = base.extend_with_texts(["hello"], ["en"])
+    assert extended.char2id == base.char2id

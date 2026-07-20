@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 AVAILABLE_LANGS = [
     "en", "ko", "ja", "ar", "bg", "cs", "da", "de", "el", "es", "et", "fi", "fr",
     "hi", "hr", "hu", "id", "it", "lt", "lv", "nl", "pl", "pt", "ro", "ru", "sk",
-    "sl", "sv", "tr", "uk", "vi", "na",
+    "sl", "sv", "tr", "uk", "vi", "na", "ur",
 ]
 
 _PUNCT_END = re.compile(r"[.!?;:,'\"')\]}…。」』】〉》›»]$")
@@ -42,6 +42,22 @@ class CharTokenizer:
             chars.update(normalize_text(text, lang))
         char2id = {c: i + 1 for i, c in enumerate(sorted(chars))}
         return cls(char2id=char2id)
+
+    def extend_with_texts(self, texts: list[str], langs: list[str]) -> "CharTokenizer":
+        """Returns a new tokenizer that keeps every existing char->id mapping unchanged
+        (so a pretrained embedding table stays row-aligned) and appends ids for any
+        character in `texts` that isn't already covered -- e.g. a new language's script
+        missing from the ported model's unicode_indexer.json."""
+        chars = set()
+        for text, lang in zip(texts, langs):
+            chars.update(normalize_text(text, lang))
+        new_chars = sorted(chars - self.char2id.keys())
+        next_id = max(self.char2id.values(), default=0) + 1
+        char2id = dict(self.char2id)
+        for c in new_chars:
+            char2id[c] = next_id
+            next_id += 1
+        return CharTokenizer(char2id=char2id)
 
     def encode(self, text: str, lang: str) -> list[int]:
         text = normalize_text(text, lang)
