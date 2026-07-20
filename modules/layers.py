@@ -110,6 +110,14 @@ class RotaryEmbedding(nn.Module):
         emb = torch.cat([freqs, freqs], dim=-1)
         return emb.cos().to(dtype), emb.sin().to(dtype)
 
+    def cos_sin_from_positions(self, positions: torch.Tensor, dtype=None):
+        """positions: (..., T) float rotary positions. Returns cos, sin each (..., T, dim).
+        Used for length-aware RoPE, where each sample's positions are normalized by its own
+        sequence length so cross-attention between different-length sequences stays diagonal."""
+        freqs = positions.unsqueeze(-1) * self.inv_freq.to(device=positions.device)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        return emb.cos().to(dtype), emb.sin().to(dtype)
+
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x.chunk(2, dim=-1)
@@ -117,8 +125,13 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    # x: (B, H, T, D_head), cos/sin: (T, D_head)
-    return x * cos.unsqueeze(0).unsqueeze(0) + _rotate_half(x) * sin.unsqueeze(0).unsqueeze(0)
+    # x: (B, H, T, D_head); cos/sin either (T, D_head) shared across the batch,
+    # or (B, T, D_head) when positions are per-sample (length-aware RoPE).
+    if cos.dim() == 2:
+        cos, sin = cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0)  # (1,1,T,D)
+    else:
+        cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)  # (B,1,T,D)
+    return x * cos + _rotate_half(x) * sin
 
 
 class Attention(nn.Module):
@@ -162,8 +175,19 @@ class Attention(nn.Module):
         mask: torch.Tensor | None = None,
         q_pos_scale: float = 1.0,
         k_pos_scale: float = 1.0,
+        length_aware: bool = False,
+        rotary_gamma: float = 1.0,
+        q_len: torch.Tensor | None = None,
+        k_len: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """x_q, x_kv: (B, C, T). mask: (B, 1, T_kv) with 1=valid. Returns (B, C, T_q)."""
+        """x_q, x_kv: (B, C, T). mask: (B, 1, T_kv) with 1=valid. Returns (B, C, T_q).
+
+        length_aware=True uses length-normalized RoPE (arXiv:2509.11084): each sample's query
+        positions are gamma * m / q_len and key positions gamma * n / k_len, so cross-attention
+        between sequences of very different lengths (here ~1.1 latent frames per text token)
+        keeps a monotonic diagonal instead of the ~diagonal-destroying absolute-index scaling.
+        q_len/k_len are true (unpadded) lengths, (B,); they fall back to the padded length.
+        Otherwise q_pos_scale/k_pos_scale apply the legacy absolute-index scaling."""
         q = self.to_q(x_q.transpose(1, 2))
         k = self.to_k(x_kv.transpose(1, 2))
         v = self.to_v(x_kv.transpose(1, 2))
@@ -171,8 +195,18 @@ class Attention(nn.Module):
         q, k, v = self._split_heads(q), self._split_heads(k), self._split_heads(v)
 
         if self.rotary is not None:
-            cos_q, sin_q = self.rotary(q.shape[2], q_pos_scale, q.device, q.dtype)
-            cos_k, sin_k = self.rotary(k.shape[2], k_pos_scale, k.device, k.dtype)
+            if length_aware:
+                tq, tk = q.shape[2], k.shape[2]
+                device = q.device
+                ql = (q_len if q_len is not None else torch.full((q.shape[0],), tq, device=device)).clamp(min=1).float()
+                kl = (k_len if k_len is not None else torch.full((k.shape[0],), tk, device=device)).clamp(min=1).float()
+                pos_q = rotary_gamma * torch.arange(tq, device=device).float().unsqueeze(0) / ql.unsqueeze(1)  # (B, Tq)
+                pos_k = rotary_gamma * torch.arange(tk, device=device).float().unsqueeze(0) / kl.unsqueeze(1)  # (B, Tk)
+                cos_q, sin_q = self.rotary.cos_sin_from_positions(pos_q, q.dtype)
+                cos_k, sin_k = self.rotary.cos_sin_from_positions(pos_k, q.dtype)
+            else:
+                cos_q, sin_q = self.rotary(q.shape[2], q_pos_scale, q.device, q.dtype)
+                cos_k, sin_k = self.rotary(k.shape[2], k_pos_scale, k.device, k.dtype)
             q = apply_rotary(q, cos_q, sin_q)
             k = apply_rotary(k, cos_k, sin_k)
 

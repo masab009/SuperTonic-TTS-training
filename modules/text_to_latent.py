@@ -159,7 +159,14 @@ class VFBlock(nn.Module):
         x = x * latent_mask
         x = self.convnext_1(x, latent_mask)
 
-        y = self.attn(x, text_emb, mask=text_mask, q_pos_scale=1.0, k_pos_scale=1.0 / self.rotary_scale)
+        # length-aware RoPE: normalize latent (query) and text (key) positions by each sample's
+        # own true length so the text->latent cross-attention keeps a monotonic diagonal despite
+        # the two sequences differing in length (see Attention.forward / arXiv:2509.11084). The
+        # earlier absolute-index scaling (k_pos_scale=1/rotary_scale) implied ~10 latent frames
+        # per text token, but the real ratio here is ~1.1, which prevented alignment from forming.
+        q_len = latent_mask.sum(dim=(1, 2))
+        k_len = text_mask.sum(dim=(1, 2))
+        y = self.attn(x, text_emb, mask=text_mask, length_aware=True, rotary_gamma=self.rotary_scale, q_len=q_len, k_len=k_len)
         x = self.attn_norm((x + y).transpose(1, 2)).transpose(1, 2) * latent_mask
         x = self.convnext_2(x, latent_mask)
 
